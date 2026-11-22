@@ -109,3 +109,6 @@ desktop.ini
 !**/.env.example
 !.env.example
 # END S11 LOCAL SNAPSHOT EXCLUSIONS
+
+# ===== 版本化日志交付的本地文件仓 =====
+backend/var/

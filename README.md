@@ -11,12 +11,15 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/views/DeliveryView.vue       版本化日志交付工作台
 │   ├── src/data/modules.ts              18个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/delivery_router.py  版本化日志交付接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/delivery.py 版本化清单、迁移、切换、回滚与核实
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -70,6 +73,30 @@ npm run dev
 | 回溯重放引擎 | `replay_engine` | 重放任务 | 历史批次范围、新解析规则版本、重放状态 |
 | 聚合查询视图 | `aggregation_view` | 聚合视图 | 视图名称、聚合维度、指标定义 |
 | 采集血缘 | `data_lineage` | 血缘关系 | 来源批次、解析规则版本、标准化版本 |
+
+## 版本化日志交付清单
+
+历史数据导出只按「视图名称 + 导出编号」落记录，文件路径之外没有可交换的来源结构。
+`backend/app/services/delivery.py` 把这些存量交付迁移为版本化日志交付清单：
+
+- **双写**：`build_export` 一次导出同时登记旧结构交付（`legacy-v1`）和版本化清单
+  （`versioned-manifest-v2`）。清单声明来源文件摘要、分组依据、逐条记录的每个日志
+  字段，以及生成文件摘要，写回 `data_lineage`，用于从清单反查真实文件。
+- **存量迁移**：`record_legacy` 登记旧交付，`migrate` 按交付编号逐份迁移；支持
+  `fail_after` 模拟部署中断，再次调用同一迁移编号按游标续做。已封存清单不会被覆盖。
+- **来源核实**：来源只能通过显式内容、已登记文件 ID 或旧入口保存的文件引用（内容可读）
+  确认；仅凭文件名不会建立来源绑定，清单保持 `待补来源` 且不可读。
+- **读取切换**：`switch_read_mode(view, 1|2)` 切换视图读取版本。部署期同名视图可以
+  同时存在两份交付：旧客户端读取冻结的上一份旧交付，新入口读取最新封存清单。
+- **快照下载**：`download` / `snapshot` 在同一把锁内解析「交付编号 → 完整内容」，
+  一次下载只对应一份完整清单；旧交付不会用新生成文件或重新分组的结果冒充。
+- **暂停 / 回滚**：`pause_migration` 暂停单份交付的迁移（旧结构继续可读）；
+  `rollback` 切回旧读取结构但保留清单与文件归属，`verify` 可核实原始文件、
+  旧交付文件、新生成文件各属于哪次交付，`restore_file` 按原编号还原文件。
+
+接口前缀 `/api/delivery`，前端页面 `/delivery`（导航「版本化日志交付」）。
+交付文件落在 `backend/var/deliveries/`（可用 `DELIVERY_ROOT` 覆盖，已在 `.gitignore`）。
+测试见 `backend/tests/test_delivery.py`。
 
 ## 约定
 

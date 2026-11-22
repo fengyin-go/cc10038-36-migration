@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
+import io
 import json
 import time
 from typing import Any
 
+from app.services.delivery import delivery
 from app.store import store
 
 
@@ -412,6 +415,7 @@ class IngestPipeline:
         """基于标准化明细刷新聚合视图。"""
         parsed = store.rows("parsed_entity")
         results: dict[str, dict[str, Any]] = {}
+        contributing: list[int] = []
 
         for entity in parsed:
             if entity.get("status") != "校验通过":
@@ -420,6 +424,7 @@ class IngestPipeline:
                 fields_data = json.loads(entity.get("标准化字段集", "{}"))
             except (json.JSONDecodeError, TypeError):
                 continue
+            contributing.append(int(entity.get("id", 0)))
 
             dim_val = str(fields_data.get(dim_field, "unknown"))
             metric_val = fields_data.get(metric_field, "0")
@@ -449,6 +454,8 @@ class IngestPipeline:
             "results": results,
             "refreshed_at": _now_iso(),
             "source_records": len(parsed),
+            "source_parsed_ids": contributing,
+            "dimension_field": dim_field,
         }
         aggs.append(agg_entry)
 
@@ -466,7 +473,11 @@ class IngestPipeline:
         export_format: str = "csv",
         filters: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """从聚合视图或标准化明细生成导出数据。"""
+        """从聚合视图或标准化明细生成导出数据。
+
+        部署期双写：同一份交付同时登记旧结构交付记录和版本化日志交付清单，
+        旧客户端继续按同名视图读取旧交付，新入口读取版本化清单。
+        """
         exports = store.rows("data_export")
         lineages = store.rows("data_lineage")
 
@@ -497,7 +508,36 @@ class IngestPipeline:
         }
         exports.append(export_entry)
 
-        # 记录血缘
+        # 旧结构交付内容：视图聚合结果，按导出格式落盘。
+        legacy_content = self._render_view_content(view_name, results_data, export_format)
+
+        # 版本化清单的来源：聚合视图实际消费的标准化明细及其原始记录。
+        source_records = self._source_records_for_view(view)
+        grouping_basis = []
+        if view and view.get("dimension_field"):
+            grouping_basis = [str(view["dimension_field"])]
+
+        delivery_result = delivery.register_versioned_delivery(
+            view_name,
+            legacy_content=legacy_content,
+            legacy_path=export_entry["文件路径"],
+            export_id=export_id,
+            export_format=export_format,
+            source_records=source_records,
+            grouping_basis=grouping_basis,
+            groups=results_data,
+            origin="pipeline_dual_write",
+        )
+        delivery_no = delivery_result.get("delivery_no")
+
+        export_entry["交付编号"] = delivery_no
+        export_entry["交付版本"] = delivery_result.get("delivery_version")
+        export_entry["清单摘要"] = delivery_result.get("manifest_digest")
+        export_entry["来源文件ID"] = (
+            (delivery_result.get("manifest") or {}).get("source") or {}
+        ).get("file_id")
+
+        # 记录血缘：从版本化清单定位真实文件和分组依据。
         lineage_entry = {
             "id": _next_id("data_lineage"),
             "来源批次": view_name,
@@ -510,6 +550,15 @@ class IngestPipeline:
             "abnormal": False,
             "export_id": str(export_id),
             "export_format": export_format,
+            "delivery_no": delivery_no,
+            "delivery_version": delivery_result.get("delivery_version"),
+            "manifest_digest": delivery_result.get("manifest_digest"),
+            "manifest_structure": "versioned-manifest-v2",
+            "source_file_id": export_entry.get("来源文件ID"),
+            "grouping_basis": grouping_basis,
+            "field_count": len({f for record in source_records
+                                for f in record.get("fields", {})}),
+            "record_count": len(source_records),
         }
         lineages.append(lineage_entry)
 
@@ -518,7 +567,60 @@ class IngestPipeline:
             "message": f"数据导出 {view_name}.{export_format} 完成",
             "export": export_entry,
             "lineage": lineage_entry,
+            "delivery": {
+                "delivery_no": delivery_no,
+                "delivery_version": delivery_result.get("delivery_version"),
+                "manifest_digest": delivery_result.get("manifest_digest"),
+                "structure": "versioned-manifest-v2",
+            },
         }
+
+    def _render_view_content(
+        self, view_name: str, results_data: dict[str, Any], export_format: str
+    ) -> str:
+        rows = [{"group": key, **value} for key, value in (results_data or {}).items()]
+        if export_format == "json":
+            return json.dumps(
+                {"view": view_name, "rows": rows}, ensure_ascii=False, sort_keys=True
+            )
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(["group", "count", "sum", "values"])
+        for row in rows:
+            writer.writerow([
+                row.get("group"),
+                row.get("count", 0),
+                row.get("sum", 0),
+                ",".join(str(v) for v in row.get("values", [])),
+            ])
+        return output.getvalue()
+
+    def _source_records_for_view(self, view: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """按聚合视图记录的明细 ID 追溯原始记录，供清单关联每个日志字段。"""
+        if not view:
+            return []
+        ids = set()
+        for value in view.get("source_parsed_ids") or []:
+            try:
+                ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        records: list[dict[str, Any]] = []
+        for entity in store.rows("parsed_entity"):
+            if ids and int(entity.get("id", 0)) not in ids:
+                continue
+            try:
+                fields = json.loads(entity.get("标准化字段集", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                fields = {}
+            raw_id = str(entity.get("原始记录ID", ""))
+            records.append({
+                "raw_record_id": raw_id or f"parsed-{entity.get('id')}",
+                "raw_line": int(raw_id) if raw_id.isdigit() else int(entity.get("id", 0)),
+                "parsed_id": entity.get("id"),
+                "fields": {str(k): str(v) for k, v in fields.items()},
+            })
+        return records
 
     # ---------- 水位管理 ----------
     def advance_watermark(

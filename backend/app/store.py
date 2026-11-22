@@ -16,7 +16,8 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        # 以双下划线开头的是内部草稿表（如版本化交付状态），不参与业务模块清单。
+        return sorted(name for name in self._tables if not name.startswith("__"))
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
